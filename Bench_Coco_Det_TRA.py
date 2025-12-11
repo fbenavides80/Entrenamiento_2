@@ -42,44 +42,44 @@ class EarlyStopping:
 # ==============================================================================
 # 1. PREPARACIÓN DE DATOS (PROCESSOR & COLLATE)
 # ==============================================================================
-# Usamos el procesador oficial de Facebook para normalizar imágenes y cajas
+# Usamos el procesador oficial de Facebook
 PROCESSOR = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
 
 def detr_collate_fn(batch):
     """
-    Procesa un batch de ejemplos raw de 'datasets' para el formato de DETR.
-    DETR necesita: pixel_values, pixel_mask y labels (class_labels + boxes).
+    CORREGIDO: Reestructura las anotaciones de COCO al formato requerido por DetrImageProcessor 
+    (lista de dicts con claves 'image_id' y 'annotations').
     """
     images = []
-    targets = []
+    targets_for_processor = [] 
     
     for item in batch:
         images.append(item['image'].convert("RGB"))
         
-        # Convertir anotaciones de COCO al formato de DETR
-        # COCO:  [x, y, w, h] (absoluto)
-        # DETR espera que el procesador lo convierta, pero necesitamos pasarle el formato correcto.
-        annotations = item['objects']
-        new_ann = {'image_id': item['image_id'], 'annotations': []}
+        # 1. Construir la lista de anotaciones COCO necesarias 
+        coco_annotations = []
         
-        # Filtrar cajas vacías o inválidas
-        valid_boxes = []
-        valid_labels = []
-        
-        for bbox, category in zip(annotations['bbox'], annotations['category']):
+        # Iterar sobre las cajas y etiquetas del batch item
+        for bbox, category in zip(item['objects']['bbox'], item['objects']['category']):
             x, y, w, h = bbox
             if w > 0 and h > 0:
-                # El procesador de HuggingFace maneja la conversión a (cx, cy, w, h) norm
-                # si le pasamos las cajas en formato 'coco_detection'
-                valid_boxes.append([x, y, w, h])
-                valid_labels.append(category)
+                coco_annotations.append({
+                    # Bbox en formato COCO: [x, y, w, h] (absoluto)
+                    'bbox': [x, y, w, h], 
+                    # category_id (el procesador lo mapea)
+                    'category_id': category 
+                })
         
-        targets.append({'boxes': valid_boxes, 'class_labels': valid_labels})
+        # 2. Construir la estructura de target requerida por el procesador (Metadata)
+        targets_for_processor.append({
+            'image_id': item['image_id'],
+            'annotations': coco_annotations
+        })
 
-    # El procesador hace el padding y la normalización automáticamente
-    # return_tensors="pt" devuelve tensores de PyTorch listos para GPU
-    encoding = PROCESSOR(images=images, annotations=targets, return_tensors="pt")
+    # El procesador hace el padding, normalización y conversión a DETR targets (cx,cy,w,h)
+    encoding = PROCESSOR(images=images, annotations=targets_for_processor, return_tensors="pt")
     
+    # El diccionario 'encoding' contiene ahora 'pixel_values', 'pixel_mask' y 'labels' (convertido)
     return encoding
 
 # ==============================================================================
@@ -114,8 +114,9 @@ if __name__ == '__main__':
         pass
 
     # --- CONFIGURACIÓN ---
+    # CORREGIDO: Usaremos la GPU 0 por tener más VRAM libre.
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    BATCH_SIZE = 64        # Ambicioso, para A100 80GB
+    BATCH_SIZE = 64        # Óptimo para A100 80GB
     EPOCHS = 10
     LOCAL_CACHE = "/data"  # Mapeo del volumen
     
@@ -132,8 +133,6 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=detr_collate_fn, num_workers=4)
 
     # --- MODELO ---
-    # Usamos DETR con ResNet-50 preentrenado. Ignoramos mismatch de tamaños si cambiamos num_classes, 
-    # pero aquí usaremos las clases por defecto de COCO (91) para aprovechar los pesos.
     model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
     model.to(DEVICE)
 
@@ -143,16 +142,19 @@ if __name__ == '__main__':
     # --- ENTRENAMIENTO ---
     print("Iniciando Entrenamiento...")
     start_train = time.time()
+    total_epochs_run = 0
 
     for epoch in range(EPOCHS):
+        total_epochs_run = epoch + 1
         model.train()
         for batch in tqdm(train_loader, desc=f"Ep {epoch+1} Train"):
-            # Mover batch a GPU
+            # Mover batch a GPU (excepto el objeto 'labels' que es complejo)
             pixel_values = batch["pixel_values"].to(DEVICE)
             pixel_mask = batch["pixel_mask"].to(DEVICE)
+            
+            # Mover la lista de diccionarios de labels a la GPU
             labels = [{k: v.to(DEVICE) for k, v in t.items()} for t in batch["labels"]]
 
-            # Forward pass (DETR calcula la loss internamente si recibe labels)
             outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
             loss = outputs.loss
 
@@ -175,18 +177,19 @@ if __name__ == '__main__':
                 steps += 1
         
         avg_loss = val_loss_sum / steps if steps > 0 else 0
-        print(f"Validation Loss: {avg_loss:.4f}")
+        print(f"\n[EPOCH {epoch+1}] Validation Loss: {avg_loss:.4f}")
         
         early_stopping(avg_loss, model)
         if early_stopping.early_stop:
-            print("Stop!")
+            print("🚫 Detención temprana activada.")
             break
 
     training_time = time.time() - start_train
 
     # --- INFERENCIA & mAP ---
-    print("Calculando mAP...")
-    model.load_state_dict(torch.load("best_detr_model.pth"))
+    print("\n--- Calculando mAP (100 batches) ---")
+    if os.path.exists("best_detr_model.pth"):
+        model.load_state_dict(torch.load("best_detr_model.pth"))
     model.eval()
     
     metric = MeanAveragePrecision(box_format="xyxy", iou_type="bbox").to(DEVICE)
@@ -194,29 +197,27 @@ if __name__ == '__main__':
     
     times = []
     
-    # Limitamos a 100 batches para no eternizar el benchmark de inferencia
     with torch.no_grad():
         for i, batch in enumerate(tqdm(val_loader, desc="Inferencia", total=100)):
             if i >= 100: break
             
             pixel_values = batch["pixel_values"].to(DEVICE)
             pixel_mask = batch["pixel_mask"].to(DEVICE)
-            orig_labels = batch["labels"] # Labels originales para metric target
+            orig_labels = batch["labels"] # Targets ya transformados
 
             t0 = time.time()
             outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
             t1 = time.time()
             times.append((t1 - t0) / len(pixel_values))
 
-            # Post-proceso: Convertir (cx,cy,w,h) relativo -> (x,y,x,y) absoluto
-            # Necesitamos el tamaño original de las imágenes. 
-            # Como ejemplo simplificado, usaremos el tamaño del tensor (no es exacto pixel a pixel vs original, 
-            # pero sirve para benchmark técnico).
+            # Obtener el tamaño del tensor para post-procesamiento
             target_sizes = torch.tensor([img.shape[1:] for img in pixel_values]).to(DEVICE)
             results = PROCESSOR.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.3)
 
             # Formato para torchmetrics
             formatted_preds = []
+            formatted_targets = []
+            
             for res in results:
                 formatted_preds.append({
                     "boxes": res["boxes"],
@@ -224,27 +225,12 @@ if __name__ == '__main__':
                     "labels": res["labels"]
                 })
             
-            # Formato targets (hay que revertir la normalización de DETR o usar los datos raw, 
-            # aquí simplificamos asumiendo que el target se ajusta a la predicción para benchmark)
-            # NOTA: Para mAP exacto de COCO, se requiere usar los tamaños originales de imagen.
-            # Para benchmark de velocidad/memoria, esto es suficiente.
-            formatted_targets = []
-            for t, size in zip(orig_labels, target_sizes):
-                 # Convertir target relativo de vuelta a absoluto para la métrica
-                 boxes = t['boxes'].to(DEVICE)
-                 # cxcywh -> xyxy
-                 h, w = size
-                 scale_fct = torch.tensor([w, h, w, h]).to(DEVICE)
-                 # Conversión manual simple
-                 boxes = boxes * scale_fct
-                 # Convertir cxcywh a xyxy
-                 b_box = torch.zeros_like(boxes)
-                 b_box[:, 0] = boxes[:, 0] - boxes[:, 2]/2
-                 b_box[:, 1] = boxes[:, 1] - boxes[:, 3]/2
-                 b_box[:, 2] = boxes[:, 0] + boxes[:, 2]/2
-                 b_box[:, 3] = boxes[:, 1] + boxes[:, 3]/2
-                 
-                 formatted_targets.append({"boxes": b_box, "labels": t["class_labels"].to(DEVICE)})
+            # Reestructurar targets a formato de torchmetrics (solo xyxy y labels)
+            for t in orig_labels:
+                 formatted_targets.append({
+                     "boxes": t['boxes'].to(DEVICE),
+                     "labels": t["class_labels"].to(DEVICE)
+                 })
 
             metric.update(formatted_preds, formatted_targets)
 
