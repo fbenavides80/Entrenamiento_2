@@ -42,13 +42,11 @@ class EarlyStopping:
 # ==============================================================================
 # 1. PREPARACIÓN DE DATOS (PROCESSOR & COLLATE)
 # ==============================================================================
-# Usamos el procesador oficial de Facebook
 PROCESSOR = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
 
 def detr_collate_fn(batch):
     """
-    CORREGIDO: Reestructura las anotaciones de COCO al formato requerido por DetrImageProcessor 
-    (lista de dicts con claves 'image_id' y 'annotations').
+    CORRECCIÓN FINAL V2: Agrega 'area' e 'iscrowd' requeridos estrictamente por Hugging Face.
     """
     images = []
     targets_for_processor = [] 
@@ -56,30 +54,29 @@ def detr_collate_fn(batch):
     for item in batch:
         images.append(item['image'].convert("RGB"))
         
-        # 1. Construir la lista de anotaciones COCO necesarias 
         coco_annotations = []
         
-        # Iterar sobre las cajas y etiquetas del batch item
+        # Iteramos sobre las cajas
         for bbox, category in zip(item['objects']['bbox'], item['objects']['category']):
             x, y, w, h = bbox
+            # Solo cajas válidas
             if w > 0 and h > 0:
                 coco_annotations.append({
-                    # Bbox en formato COCO: [x, y, w, h] (absoluto)
                     'bbox': [x, y, w, h], 
-                    # category_id (el procesador lo mapea)
-                    'category_id': category 
+                    'category_id': int(category),
+                    'area': w * h,       # <--- CRÍTICO: El procesador exige esto
+                    'iscrowd': 0         # <--- CRÍTICO: Se asume 0 para entrenamiento estándar
                 })
         
-        # 2. Construir la estructura de target requerida por el procesador (Metadata)
+        # Agregamos 'image_id' (necesario para evaluación) y la lista de anotaciones
         targets_for_processor.append({
-            'image_id': item['image_id'],
+            'image_id': item.get('image_id', 0), 
             'annotations': coco_annotations
         })
 
-    # El procesador hace el padding, normalización y conversión a DETR targets (cx,cy,w,h)
+    # El procesador convierte todo a tensores y formato (cx,cy,w,h)
     encoding = PROCESSOR(images=images, annotations=targets_for_processor, return_tensors="pt")
     
-    # El diccionario 'encoding' contiene ahora 'pixel_values', 'pixel_mask' y 'labels' (convertido)
     return encoding
 
 # ==============================================================================
@@ -106,7 +103,6 @@ def print_final_report(training_time, best_val_loss, avg_inference_time, estimat
 # BLOQUE PRINCIPAL
 # ==============================================================================
 if __name__ == '__main__':
-    # Configuración de Spawn para CUDA
     try:
         if mp.get_start_method(allow_none=True) != 'spawn':
             mp.set_start_method('spawn', force=True)
@@ -114,21 +110,18 @@ if __name__ == '__main__':
         pass
 
     # --- CONFIGURACIÓN ---
-    # CORREGIDO: Usaremos la GPU 0 por tener más VRAM libre.
     DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    BATCH_SIZE = 64        # Óptimo para A100 80GB
+    BATCH_SIZE = 64        
     EPOCHS = 10
-    LOCAL_CACHE = "/data"  # Mapeo del volumen
+    LOCAL_CACHE = "/data"  
     
     print(f"--- Iniciando Benchmark Transformer (DETR) en {DEVICE} ---")
     print(f"--- Batch Size: {BATCH_SIZE} | Dataset Completo ---")
 
     # --- CARGA DE DATOS ---
-    # Cargamos el dataset completo desde la carpeta local
     train_dataset = load_dataset("detection-datasets/coco", split="train", cache_dir=LOCAL_CACHE)
     val_dataset = load_dataset("detection-datasets/coco", split="val", cache_dir=LOCAL_CACHE)
 
-    # DataLoaders con el collate específico de DETR
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=detr_collate_fn, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=detr_collate_fn, num_workers=4)
 
@@ -148,11 +141,8 @@ if __name__ == '__main__':
         total_epochs_run = epoch + 1
         model.train()
         for batch in tqdm(train_loader, desc=f"Ep {epoch+1} Train"):
-            # Mover batch a GPU (excepto el objeto 'labels' que es complejo)
             pixel_values = batch["pixel_values"].to(DEVICE)
             pixel_mask = batch["pixel_mask"].to(DEVICE)
-            
-            # Mover la lista de diccionarios de labels a la GPU
             labels = [{k: v.to(DEVICE) for k, v in t.items()} for t in batch["labels"]]
 
             outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask, labels=labels)
@@ -162,7 +152,7 @@ if __name__ == '__main__':
             loss.backward()
             optimizer.step()
 
-        # --- VALIDACIÓN (Loss) ---
+        # --- VALIDACIÓN ---
         model.eval()
         val_loss_sum = 0
         steps = 0
@@ -203,18 +193,16 @@ if __name__ == '__main__':
             
             pixel_values = batch["pixel_values"].to(DEVICE)
             pixel_mask = batch["pixel_mask"].to(DEVICE)
-            orig_labels = batch["labels"] # Targets ya transformados
+            orig_labels = batch["labels"]
 
             t0 = time.time()
             outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
             t1 = time.time()
             times.append((t1 - t0) / len(pixel_values))
 
-            # Obtener el tamaño del tensor para post-procesamiento
             target_sizes = torch.tensor([img.shape[1:] for img in pixel_values]).to(DEVICE)
             results = PROCESSOR.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.3)
 
-            # Formato para torchmetrics
             formatted_preds = []
             formatted_targets = []
             
@@ -225,7 +213,6 @@ if __name__ == '__main__':
                     "labels": res["labels"]
                 })
             
-            # Reestructurar targets a formato de torchmetrics (solo xyxy y labels)
             for t in orig_labels:
                  formatted_targets.append({
                      "boxes": t['boxes'].to(DEVICE),
